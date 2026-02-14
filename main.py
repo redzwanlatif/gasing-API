@@ -1,20 +1,43 @@
 from __future__ import annotations
 
+import logging
 import os
+import random
+from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from models.behaviour_classifier import BehaviourClassifier
 from models.llm_generator import LLMGenerator
 from models.market_analyzer import MarketAnalyzer
+from services.deriv_client import DerivClient
 
 load_dotenv()
+logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Spirit Trader API", version="1.0.0")
+# Deriv client (initialized in lifespan)
+deriv_client = DerivClient(app_id=os.getenv("DERIV_APP_ID", "1089"))
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: connect to Deriv
+    try:
+        await deriv_client.connect()
+        logger.info("Deriv WebSocket client connected")
+    except Exception as e:
+        logger.warning("Deriv connection failed on startup (will retry): %s", e)
+    yield
+    # Shutdown: disconnect
+    await deriv_client.disconnect()
+    logger.info("Deriv WebSocket client disconnected")
+
+
+app = FastAPI(title="Spirit Trader API", version="1.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -220,6 +243,151 @@ async def explain_trade(request: ExplainLossRequest) -> dict[str, Any]:
         return result
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- Live Market Data Endpoints (Deriv API) ---
+
+NARRATIVE_TEMPLATES = {
+    "bullish": [
+        "The trade winds blow strong from the east — prices surge like monsoon tides.",
+        "Merchants rush to the docks. The spice prices climb with the morning sun.",
+        "The harbour bustles. Every ship that arrives carries fortune on its bow.",
+    ],
+    "bearish": [
+        "Dark clouds gather over the straits. Traders whisper of falling prices.",
+        "The docks grow quiet. Prices sink like stones in the harbour waters.",
+        "A cold wind sweeps the market. The bold retreat, the wise wait.",
+    ],
+    "neutral": [
+        "The waters are calm today. Prices drift like boats without wind.",
+        "Neither storm nor sun — the market holds its breath, waiting.",
+        "The harbour hums with quiet trade. No great fortune nor ruin today.",
+    ],
+    "overbought": [
+        "Greed fills the air like incense smoke — prices have climbed too high, too fast.",
+        "The merchants celebrate, but Seri warns: what rises without rest must fall.",
+    ],
+    "oversold": [
+        "Fear grips the harbour. Prices have fallen far — perhaps too far.",
+        "The docks are empty, but opportunity hides in the shadows of despair.",
+    ],
+}
+
+
+def _build_narrative(analysis: dict[str, Any], tick: dict[str, Any] | None) -> str:
+    """Convert technical analysis into game-world narrative."""
+    trend = analysis.get("trend", "neutral")
+    rsi_signal = analysis.get("indicators", {}).get("rsi_signal", "neutral")
+
+    # Pick narrative based on RSI extremes first, then trend
+    if rsi_signal == "overbought":
+        pool = NARRATIVE_TEMPLATES["overbought"]
+    elif rsi_signal == "oversold":
+        pool = NARRATIVE_TEMPLATES["oversold"]
+    else:
+        pool = NARRATIVE_TEMPLATES.get(trend, NARRATIVE_TEMPLATES["neutral"])
+
+    narrative = random.choice(pool)
+
+    # Add price context
+    if tick:
+        price = tick.get("quote", 0)
+        narrative += f"\n\nCurrent price: {price:.2f} gold pieces."
+
+    return narrative
+
+
+@app.get("/market/symbols")
+async def get_market_symbols() -> dict[str, Any]:
+    """Get available Deriv trading symbols."""
+    try:
+        symbols = await deriv_client.get_symbols()
+        return {"symbols": symbols, "source": "deriv_live" if deriv_client.connected else "fallback"}
+    except Exception as e:
+        logger.warning("Failed to get symbols: %s", e)
+        from services.deriv_client import DEFAULT_SYMBOLS
+        return {"symbols": DEFAULT_SYMBOLS, "source": "fallback"}
+
+
+@app.get("/market/candles/{symbol}")
+async def get_market_candles(
+    symbol: str,
+    count: int = Query(default=100, ge=5, le=5000),
+    granularity: int = Query(default=60, ge=60),
+    analyse: bool = Query(default=False),
+) -> dict[str, Any]:
+    """Get live OHLC candles from Deriv, optionally with analysis."""
+    if not deriv_client.connected:
+        raise HTTPException(status_code=503, detail="Deriv connection unavailable")
+    try:
+        candles = await deriv_client.get_candles(symbol, count, granularity)
+        result: dict[str, Any] = {
+            "symbol": symbol,
+            "candles": candles,
+            "count": len(candles),
+            "granularity": granularity,
+            "source": "deriv_live",
+        }
+        if analyse and len(candles) >= 5:
+            analysis = market_analyzer.analyze(candles, f"{granularity}s")
+            result["analysis"] = analysis
+        return result
+    except TimeoutError:
+        raise HTTPException(status_code=504, detail="Deriv request timed out")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/market/tick/{symbol}")
+async def get_market_tick(symbol: str) -> dict[str, Any]:
+    """Get the latest live tick for a symbol."""
+    if not deriv_client.connected:
+        raise HTTPException(status_code=503, detail="Deriv connection unavailable")
+    try:
+        tick = await deriv_client.get_tick(symbol)
+        if tick is None:
+            raise HTTPException(status_code=404, detail=f"No tick data for {symbol}")
+        return {"tick": tick, "source": "deriv_live"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/market/snapshot/{symbol}")
+async def get_market_snapshot(
+    symbol: str,
+    count: int = Query(default=50, ge=5, le=500),
+    granularity: int = Query(default=60, ge=60),
+) -> dict[str, Any]:
+    """Full market snapshot: tick + candles + analysis + game narrative.
+
+    This is the key endpoint for the live trading challenge scene.
+    """
+    if not deriv_client.connected:
+        raise HTTPException(status_code=503, detail="Deriv connection unavailable")
+    try:
+        candles = await deriv_client.get_candles(symbol, count, granularity)
+        tick = await deriv_client.get_tick(symbol)
+
+        analysis = {}
+        if len(candles) >= 5:
+            analysis = market_analyzer.analyze(candles, f"{granularity}s")
+
+        narrative = _build_narrative(analysis, tick)
+
+        return {
+            "symbol": symbol,
+            "tick": tick,
+            "candles": candles[-20:],  # Last 20 for display
+            "analysis": analysis,
+            "narrative": narrative,
+            "source": "deriv_live",
+        }
+    except TimeoutError:
+        raise HTTPException(status_code=504, detail="Deriv request timed out")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
